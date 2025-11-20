@@ -1,0 +1,12 @@
+{
+  "id": "vault-folder-sync",
+  "name": "Vault Folder Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Automatically sync added, modified, and deleted files from this vault to one or more external folders while preserving structure.",
+  "author": "Jake (with AI assistant)",
+  "authorUrl": "https://example.com",
+  "isDesktopOnly": true
+}
+
+

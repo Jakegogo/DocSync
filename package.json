@@ -1,0 +1,18 @@
+{
+  "name": "vault-folder-sync",
+  "version": "0.1.0",
+  "description": "Obsidian plugin to sync vault files to external folders.",
+  "main": "main.js",
+  "scripts": {
+    "build": "esbuild main.ts --bundle --platform=node --external:obsidian --format=cjs --outfile=main.js",
+    "dev": "esbuild main.ts --bundle --platform=node --external:obsidian --format=cjs --outfile=main.js --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.5.0",
+    "typescript": "^5.0.0"
+  }
+}
+
+
