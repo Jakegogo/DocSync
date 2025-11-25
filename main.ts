@@ -10,7 +10,21 @@ import {
 } from "obsidian";
 import * as fs from "fs";
 import * as path from "path";
-import { runReverseSyncForTargets } from "./reverse-sync";
+import { closeDiffViewIfNoConflicts, registerDiffView } from "./diff-view";
+import { createLogView } from "./log-view";
+import {
+	DEFAULT_FILENAME_RULES,
+	FilenameMappingRule,
+	getSourceAbsolutePath,
+	getTargetAbsolutePath,
+	mapSegmentBackward,
+	mapSegmentForward,
+} from "./filename-map";
+import {
+	logLocalSourceChange,
+	mergeLogsForTargets,
+	runReverseSyncForTargets,
+} from "./reverse-sync";
 
 interface SyncTarget {
 	id: string;
@@ -23,11 +37,13 @@ interface SyncTarget {
 interface VaultFolderSyncSettings {
 	targets: SyncTarget[];
 	syncIntervalSeconds: number;
+	filenameRules: FilenameMappingRule[];
 }
 
 const DEFAULT_SETTINGS: VaultFolderSyncSettings = {
 	targets: [],
 	syncIntervalSeconds: 30,
+	filenameRules: DEFAULT_FILENAME_RULES.map((r) => ({ ...r })),
 };
 
 type ChangeType = "created" | "modified" | "deleted";
@@ -47,6 +63,8 @@ export default class VaultFolderSyncPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+
+		registerDiffView(this);
 
 		this.statusBarItem = this.addStatusBarItem();
 		this.setStatusSyncing();
@@ -68,10 +86,16 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		const enabledTargets = this.settings.targets.filter(
 			(t) => t.enabled && t.path.trim().length > 0,
 		);
+		const enabledTargetPaths = enabledTargets.map((t) => t.path);
 
-		this.triggerSync(false)
+		mergeLogsForTargets(sourceRoot, enabledTargetPaths)
+			.then(() => this.triggerSync(false))
 			.then(() => this.verifyTargetsByMtime(sourceRoot, enabledTargets))
 			.then(() => this.runReverseSyncOnce(sourceRoot))
+			.then(() => {
+				// 启动时如果没有冲突文件，则关闭已有的冲突面板
+				closeDiffViewIfNoConflicts(this.app);
+			})
 			.catch((err) => {
 				console.error("Initial sync error:", err);
 				new Notice(
@@ -81,9 +105,17 @@ export default class VaultFolderSyncPlugin extends Plugin {
 	}
 
 	private async runPeriodicSync() {
+		const sourceRoot = this.getVaultRootPath();
+		const enabledTargets = this.settings.targets.filter(
+			(t) => t.path.trim().length > 0,
+		);
+		const enabledTargetPaths = enabledTargets.map((t) => t.path);
+
+		// 日志 merge 先于文件同步
+		await mergeLogsForTargets(sourceRoot, enabledTargetPaths);
+
 		if (this.isSyncing) return;
 		await this.triggerSync(false);
-		const sourceRoot = this.getVaultRootPath();
 		await this.runReverseSyncOnce(sourceRoot);
 	}
 
@@ -100,6 +132,9 @@ export default class VaultFolderSyncPlugin extends Plugin {
 			this.app.vault.on("create", (file) => {
 				if (file instanceof TFile) {
 					this.markFileChanged(file, "created");
+					logLocalSourceChange(this.app, file.path, "modified").catch(
+						() => {},
+					);
 				}
 			}),
 		);
@@ -108,6 +143,9 @@ export default class VaultFolderSyncPlugin extends Plugin {
 			this.app.vault.on("modify", (file) => {
 				if (file instanceof TFile) {
 					this.markFileChanged(file, "modified");
+					logLocalSourceChange(this.app, file.path, "modified").catch(
+						() => {},
+					);
 				}
 			}),
 		);
@@ -116,6 +154,9 @@ export default class VaultFolderSyncPlugin extends Plugin {
 			this.app.vault.on("delete", (file) => {
 				// delete 事件的 file 可能是 TFile 或 TFolder，路径相同处理
 				this.markPathDeleted(file.path);
+				logLocalSourceChange(this.app, file.path, "deleted").catch(
+					() => {},
+				);
 			}),
 		);
 
@@ -233,7 +274,7 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		const targetRoot = target.path;
 		await this.ensureDir(targetRoot);
 
-		// 全量复制源目录到目标目录
+		// 全量复制源目录到目标目录（目标目录使用 Windows 兼容的文件名）
 		await this.copyDirectoryRecursive(sourceRoot, targetRoot);
 
 		// 删除目标中多余的文件/目录，使其结构与源保持一致
@@ -249,8 +290,16 @@ export default class VaultFolderSyncPlugin extends Plugin {
 
 		// 先处理重命名，再处理普通的增删改
 		for (const rename of this.pendingRenames) {
-			const fromAbs = path.join(targetRoot, rename.from);
-			const toAbs = path.join(targetRoot, rename.to);
+			const fromAbs = getTargetAbsolutePath(
+				targetRoot,
+				rename.from,
+				this.settings.filenameRules,
+			);
+			const toAbs = getTargetAbsolutePath(
+				targetRoot,
+				rename.to,
+				this.settings.filenameRules,
+			);
 			try {
 				await this.ensureDir(path.dirname(toAbs));
 				if (await this.pathExists(fromAbs)) {
@@ -262,8 +311,12 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		}
 
 		for (const [relPath, changeType] of this.changedFiles) {
-			const sourceAbs = path.join(sourceRoot, relPath);
-			const targetAbs = path.join(targetRoot, relPath);
+			const sourceAbs = getSourceAbsolutePath(sourceRoot, relPath);
+			const targetAbs = getTargetAbsolutePath(
+				targetRoot,
+				relPath,
+				this.settings.filenameRules,
+			);
 
 			try {
 				if (changeType === "deleted") {
@@ -327,7 +380,11 @@ export default class VaultFolderSyncPlugin extends Plugin {
 
 		for (const entry of entries) {
 			const srcPath = path.join(sourceDir, entry.name);
-			const destPath = path.join(targetDir, entry.name);
+			const safeName = mapSegmentForward(
+				entry.name,
+				this.settings.filenameRules,
+			);
+			const destPath = path.join(targetDir, safeName);
 
 			if (entry.isDirectory()) {
 				await this.copyDirectoryRecursive(srcPath, destPath);
@@ -383,7 +440,11 @@ export default class VaultFolderSyncPlugin extends Plugin {
 
 		for (const entry of entries) {
 			const srcPath = path.join(sourceDir, entry.name);
-			const destPath = path.join(targetDir, entry.name);
+			const safeName = mapSegmentForward(
+				entry.name,
+				this.settings.filenameRules,
+			);
+			const destPath = path.join(targetDir, safeName);
 
 			if (entry.isDirectory()) {
 				await this.verifyDirectoryByMtime(srcPath, destPath);
@@ -420,7 +481,11 @@ export default class VaultFolderSyncPlugin extends Plugin {
 
 		for (const entry of targetEntries) {
 			const targetPath = path.join(targetDir, entry.name);
-			const sourcePath = path.join(sourceDir, entry.name);
+			const originalName = mapSegmentBackward(
+				entry.name,
+				this.settings.filenameRules,
+			);
+			const sourcePath = path.join(sourceDir, originalName);
 
 			const sourceExists = await this.pathExists(sourcePath);
 			if (sourceExists) continue;
@@ -465,7 +530,11 @@ export default class VaultFolderSyncPlugin extends Plugin {
 
 		for (const entry of entries) {
 			const targetPath = path.join(targetDir, entry.name);
-			const sourcePath = path.join(sourceDir, entry.name);
+			const originalName = mapSegmentBackward(
+				entry.name,
+				this.settings.filenameRules,
+			);
+			const sourcePath = path.join(sourceDir, originalName);
 
 			const sourceExists = await this.pathExists(sourcePath);
 			if (!sourceExists) {
@@ -556,6 +625,14 @@ export default class VaultFolderSyncPlugin extends Plugin {
 	async loadSettings() {
 		const data = await this.loadData();
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+		if (
+			!Array.isArray(this.settings.filenameRules) ||
+			this.settings.filenameRules.length === 0
+		) {
+			this.settings.filenameRules = DEFAULT_FILENAME_RULES.map((r) => ({
+				...r,
+			}));
+		}
 	}
 
 	async saveSettings() {
@@ -621,6 +698,87 @@ class VaultFolderSyncSettingTab extends PluginSettingTab {
 						}
 					}),
 			);
+
+		containerEl.createEl("h3", { text: "Windows 文件名兼容" });
+		new Setting(containerEl)
+			.setName("文件名字符替换规则")
+			.setDesc(
+				"在同步到目标目录时，将文件名中的特殊字符替换为 Windows 支持的字符；反向同步时会自动反向映射。下面每一行是一条规则：左边是源字符，右边是目标字符。",
+			);
+
+		const rulesContainer = containerEl.createEl("div");
+		const renderRules = () => {
+			rulesContainer.empty();
+			this.plugin.settings.filenameRules.forEach((rule, index) => {
+				const s = new Setting(rulesContainer)
+					.setName(`规则 ${index + 1}`)
+					.setDesc("源字符 => 目标字符")
+					.addText((text) =>
+						text
+							.setPlaceholder("源字符，例如 :")
+							.setValue(rule.from)
+							.onChange(async (value) => {
+								this.plugin.settings.filenameRules[index].from =
+									value;
+								await this.plugin.saveSettings();
+							}),
+					)
+					.addText((text) =>
+						text
+							.setPlaceholder("目标字符，例如 ：")
+							.setValue(rule.to)
+							.onChange(async (value) => {
+								this.plugin.settings.filenameRules[index].to =
+									value;
+								await this.plugin.saveSettings();
+							}),
+					)
+					.addExtraButton((button) =>
+						button
+							.setIcon("trash")
+							.setTooltip("删除该规则")
+							.onClick(async () => {
+								this.plugin.settings.filenameRules.splice(
+									index,
+									1,
+								);
+								await this.plugin.saveSettings();
+								renderRules();
+							}),
+					);
+				s.infoEl.style.whiteSpace = "pre-wrap";
+			});
+
+			new Setting(rulesContainer)
+				.setName("新增规则")
+				.setDesc("添加一条新的字符替换规则。")
+				.addButton((button) =>
+					button
+						.setButtonText("添加规则")
+						.onClick(async () => {
+							this.plugin.settings.filenameRules.push({
+								from: "",
+								to: "",
+							});
+							await this.plugin.saveSettings();
+							renderRules();
+						}),
+				)
+				.addButton((button) =>
+					button
+						.setButtonText("重置为默认规则")
+						.onClick(async () => {
+							this.plugin.settings.filenameRules =
+								DEFAULT_FILENAME_RULES.map((r) => ({ ...r }));
+							await this.plugin.saveSettings();
+							renderRules();
+							new Notice(
+								"Vault Folder Sync: 已重置为默认的 Windows 文件名兼容规则。",
+							);
+						}),
+				);
+		};
+		renderRules();
 
 		containerEl.createEl("h3", { text: "同步目标目录" });
 
@@ -723,6 +881,7 @@ class VaultFolderSyncSettingTab extends PluginSettingTab {
 						this.display();
 					}),
 			);
+		createLogView(containerEl, this.app);
 	}
 }
 
