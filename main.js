@@ -875,7 +875,11 @@ async function openDiffForConflict(app, relPath, sourcePath, targetPath) {
     }
     leaf = leaves[0];
   } else {
-    leaf = app.workspace.getRightLeaf(false);
+    const maybeLeaf = app.workspace.getRightLeaf(false);
+    if (!maybeLeaf) {
+      return;
+    }
+    leaf = maybeLeaf;
   }
   await leaf.setViewState({
     type: DIFF_VIEW_TYPE2,
@@ -1885,57 +1889,6 @@ var VaultFolderSyncSettingTab = class extends import_obsidian4.PluginSettingTab 
         }
       })
     );
-    containerEl.createEl("h3", { text: "Windows \u6587\u4EF6\u540D\u517C\u5BB9" });
-    new import_obsidian4.Setting(containerEl).setName("\u6587\u4EF6\u540D\u5B57\u7B26\u66FF\u6362\u89C4\u5219").setDesc(
-      "\u5728\u540C\u6B65\u5230\u76EE\u6807\u76EE\u5F55\u65F6\uFF0C\u5C06\u6587\u4EF6\u540D\u4E2D\u7684\u7279\u6B8A\u5B57\u7B26\u66FF\u6362\u4E3A Windows \u652F\u6301\u7684\u5B57\u7B26\uFF1B\u53CD\u5411\u540C\u6B65\u65F6\u4F1A\u81EA\u52A8\u53CD\u5411\u6620\u5C04\u3002\u4E0B\u9762\u6BCF\u4E00\u884C\u662F\u4E00\u6761\u89C4\u5219\uFF1A\u5DE6\u8FB9\u662F\u6E90\u5B57\u7B26\uFF0C\u53F3\u8FB9\u662F\u76EE\u6807\u5B57\u7B26\u3002"
-    );
-    const rulesContainer = containerEl.createEl("div");
-    const renderRules = () => {
-      rulesContainer.empty();
-      this.plugin.settings.filenameRules.forEach((rule, index) => {
-        const s = new import_obsidian4.Setting(rulesContainer).setName(`\u89C4\u5219 ${index + 1}`).setDesc("\u6E90\u5B57\u7B26 => \u76EE\u6807\u5B57\u7B26").addText(
-          (text) => text.setPlaceholder("\u6E90\u5B57\u7B26\uFF0C\u4F8B\u5982 :").setValue(rule.from).onChange(async (value) => {
-            this.plugin.settings.filenameRules[index].from = value;
-            await this.plugin.saveSettings();
-          })
-        ).addText(
-          (text) => text.setPlaceholder("\u76EE\u6807\u5B57\u7B26\uFF0C\u4F8B\u5982 \uFF1A").setValue(rule.to).onChange(async (value) => {
-            this.plugin.settings.filenameRules[index].to = value;
-            await this.plugin.saveSettings();
-          })
-        ).addExtraButton(
-          (button) => button.setIcon("trash").setTooltip("\u5220\u9664\u8BE5\u89C4\u5219").onClick(async () => {
-            this.plugin.settings.filenameRules.splice(
-              index,
-              1
-            );
-            await this.plugin.saveSettings();
-            renderRules();
-          })
-        );
-        s.infoEl.style.whiteSpace = "pre-wrap";
-      });
-      new import_obsidian4.Setting(rulesContainer).setName("\u65B0\u589E\u89C4\u5219").setDesc("\u6DFB\u52A0\u4E00\u6761\u65B0\u7684\u5B57\u7B26\u66FF\u6362\u89C4\u5219\u3002").addButton(
-        (button) => button.setButtonText("\u6DFB\u52A0\u89C4\u5219").onClick(async () => {
-          this.plugin.settings.filenameRules.push({
-            from: "",
-            to: ""
-          });
-          await this.plugin.saveSettings();
-          renderRules();
-        })
-      ).addButton(
-        (button) => button.setButtonText("\u91CD\u7F6E\u4E3A\u9ED8\u8BA4\u89C4\u5219").onClick(async () => {
-          this.plugin.settings.filenameRules = DEFAULT_FILENAME_RULES.map((r) => ({ ...r }));
-          await this.plugin.saveSettings();
-          renderRules();
-          new import_obsidian4.Notice(
-            "Vault Folder Sync: \u5DF2\u91CD\u7F6E\u4E3A\u9ED8\u8BA4\u7684 Windows \u6587\u4EF6\u540D\u517C\u5BB9\u89C4\u5219\u3002"
-          );
-        })
-      );
-    };
-    renderRules();
     containerEl.createEl("h3", { text: "\u540C\u6B65\u76EE\u6807\u76EE\u5F55" });
     this.plugin.settings.targets.forEach((target) => {
       const s = new import_obsidian4.Setting(containerEl).setName(target.path || "(\u672A\u8BBE\u7F6E\u8DEF\u5F84)").setDesc("\u5C06\u5F53\u524D vault \u540C\u6B65\u5230\u8BE5\u76EE\u5F55\u3002").addToggle((toggle) => {
@@ -2005,5 +1958,56 @@ var VaultFolderSyncSettingTab = class extends import_obsidian4.PluginSettingTab 
       })
     );
     createLogView(containerEl, this.app);
+    containerEl.createEl("h3", { text: "Windows \u6587\u4EF6\u540D\u517C\u5BB9" });
+    new import_obsidian4.Setting(containerEl).setName("\u6587\u4EF6\u540D\u5B57\u7B26\u66FF\u6362\u89C4\u5219").setDesc(
+      "\u5728\u540C\u6B65\u5230\u76EE\u6807\u76EE\u5F55\u65F6\uFF0C\u5C06\u6587\u4EF6\u540D\u4E2D\u7684\u7279\u6B8A\u5B57\u7B26\u66FF\u6362\u4E3A Windows \u652F\u6301\u7684\u5B57\u7B26\uFF1B\u53CD\u5411\u540C\u6B65\u65F6\u4F1A\u81EA\u52A8\u53CD\u5411\u6620\u5C04\u3002\u4E0B\u9762\u6BCF\u4E00\u884C\u662F\u4E00\u6761\u89C4\u5219\uFF1A\u5DE6\u8FB9\u662F\u6E90\u5B57\u7B26\uFF0C\u53F3\u8FB9\u662F\u76EE\u6807\u5B57\u7B26\u3002"
+    );
+    const rulesContainer = containerEl.createEl("div");
+    const renderRules = () => {
+      rulesContainer.empty();
+      this.plugin.settings.filenameRules.forEach((rule, index) => {
+        const s = new import_obsidian4.Setting(rulesContainer).setName(`\u89C4\u5219 ${index + 1}`).setDesc("\u6E90\u5B57\u7B26 => \u76EE\u6807\u5B57\u7B26").addText(
+          (text) => text.setPlaceholder("\u6E90\u5B57\u7B26\uFF0C\u4F8B\u5982 :").setValue(rule.from).onChange(async (value) => {
+            this.plugin.settings.filenameRules[index].from = value;
+            await this.plugin.saveSettings();
+          })
+        ).addText(
+          (text) => text.setPlaceholder("\u76EE\u6807\u5B57\u7B26\uFF0C\u4F8B\u5982 \uFF1A").setValue(rule.to).onChange(async (value) => {
+            this.plugin.settings.filenameRules[index].to = value;
+            await this.plugin.saveSettings();
+          })
+        ).addExtraButton(
+          (button) => button.setIcon("trash").setTooltip("\u5220\u9664\u8BE5\u89C4\u5219").onClick(async () => {
+            this.plugin.settings.filenameRules.splice(
+              index,
+              1
+            );
+            await this.plugin.saveSettings();
+            renderRules();
+          })
+        );
+        s.infoEl.style.whiteSpace = "pre-wrap";
+      });
+      new import_obsidian4.Setting(rulesContainer).setName("\u65B0\u589E\u89C4\u5219").setDesc("\u6DFB\u52A0\u4E00\u6761\u65B0\u7684\u5B57\u7B26\u66FF\u6362\u89C4\u5219\u3002").addButton(
+        (button) => button.setButtonText("\u6DFB\u52A0\u89C4\u5219").onClick(async () => {
+          this.plugin.settings.filenameRules.push({
+            from: "",
+            to: ""
+          });
+          await this.plugin.saveSettings();
+          renderRules();
+        })
+      ).addButton(
+        (button) => button.setButtonText("\u91CD\u7F6E\u4E3A\u9ED8\u8BA4\u89C4\u5219").onClick(async () => {
+          this.plugin.settings.filenameRules = DEFAULT_FILENAME_RULES.map((r) => ({ ...r }));
+          await this.plugin.saveSettings();
+          renderRules();
+          new import_obsidian4.Notice(
+            "Vault Folder Sync: \u5DF2\u91CD\u7F6E\u4E3A\u9ED8\u8BA4\u7684 Windows \u6587\u4EF6\u540D\u517C\u5BB9\u89C4\u5219\u3002"
+          );
+        })
+      );
+    };
+    renderRules();
   }
 };

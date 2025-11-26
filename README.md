@@ -42,6 +42,7 @@ npm run dev
 
 构建完成后会在项目根目录生成打包后的 `main.js`，与 `manifest.json` 一起作为 Obsidian 插件入口（内部已包含反向同步模块的代码）。
 
+
 ### 构建脚本使用方法
 
 项目提供了简化的构建 + 部署脚本，分别适用于 macOS/Linux 和 Windows。
@@ -133,3 +134,46 @@ build-vault-folder-sync.bat "C:\Users\you\Documents\SomeVault\.obsidian\plugins\
   - 插件卸载时会尝试执行一次同步，把余下的变更尽量同步出去（受 Obsidian 关闭时间限制，不能保证一定完成）。
 
 
+### 运行测试用例
+
+- **运行全部测试**
+
+在项目根目录执行：
+
+```bash
+npm test
+```
+
+- **只运行某一个测试用例**
+
+方式一：使用 Jest 的名称过滤（推荐）。例如只运行用例  
+`writes newer target changes back to source during reverse sync and logs the modification`：
+
+```bash
+npm test -- -t "writes newer target changes back to source during reverse sync and logs the modification"
+```
+
+也可以只写名称的一部分关键字，例如：
+
+```bash
+npm test -- -t "writes newer target changes"
+```
+
+方式二：在测试文件中使用 `.only`，例如：
+
+```ts
+it.only(
+  "writes newer target changes back to source during reverse sync and logs the modification",
+  async () => {
+    // ...
+  },
+);
+```
+
+然后正常执行：
+
+```bash
+npm test
+```
+
+调试完成后记得移除 `.only`，以免之后只跑这一条用例。

@@ -222,7 +222,12 @@ async function openDiffForConflict(
 		}
 		leaf = leaves[0];
 	} else {
-		leaf = app.workspace.getRightLeaf(false);
+		const maybeLeaf = app.workspace.getRightLeaf(false);
+		if (!maybeLeaf) {
+			// 在极端情况下可能拿不到侧边栏叶子，此时直接返回，不影响后续同步逻辑
+			return;
+		}
+		leaf = maybeLeaf;
 	}
 
 	await leaf.setViewState({

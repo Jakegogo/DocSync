@@ -699,87 +699,6 @@ class VaultFolderSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		containerEl.createEl("h3", { text: "Windows 文件名兼容" });
-		new Setting(containerEl)
-			.setName("文件名字符替换规则")
-			.setDesc(
-				"在同步到目标目录时，将文件名中的特殊字符替换为 Windows 支持的字符；反向同步时会自动反向映射。下面每一行是一条规则：左边是源字符，右边是目标字符。",
-			);
-
-		const rulesContainer = containerEl.createEl("div");
-		const renderRules = () => {
-			rulesContainer.empty();
-			this.plugin.settings.filenameRules.forEach((rule, index) => {
-				const s = new Setting(rulesContainer)
-					.setName(`规则 ${index + 1}`)
-					.setDesc("源字符 => 目标字符")
-					.addText((text) =>
-						text
-							.setPlaceholder("源字符，例如 :")
-							.setValue(rule.from)
-							.onChange(async (value) => {
-								this.plugin.settings.filenameRules[index].from =
-									value;
-								await this.plugin.saveSettings();
-							}),
-					)
-					.addText((text) =>
-						text
-							.setPlaceholder("目标字符，例如 ：")
-							.setValue(rule.to)
-							.onChange(async (value) => {
-								this.plugin.settings.filenameRules[index].to =
-									value;
-								await this.plugin.saveSettings();
-							}),
-					)
-					.addExtraButton((button) =>
-						button
-							.setIcon("trash")
-							.setTooltip("删除该规则")
-							.onClick(async () => {
-								this.plugin.settings.filenameRules.splice(
-									index,
-									1,
-								);
-								await this.plugin.saveSettings();
-								renderRules();
-							}),
-					);
-				s.infoEl.style.whiteSpace = "pre-wrap";
-			});
-
-			new Setting(rulesContainer)
-				.setName("新增规则")
-				.setDesc("添加一条新的字符替换规则。")
-				.addButton((button) =>
-					button
-						.setButtonText("添加规则")
-						.onClick(async () => {
-							this.plugin.settings.filenameRules.push({
-								from: "",
-								to: "",
-							});
-							await this.plugin.saveSettings();
-							renderRules();
-						}),
-				)
-				.addButton((button) =>
-					button
-						.setButtonText("重置为默认规则")
-						.onClick(async () => {
-							this.plugin.settings.filenameRules =
-								DEFAULT_FILENAME_RULES.map((r) => ({ ...r }));
-							await this.plugin.saveSettings();
-							renderRules();
-							new Notice(
-								"Vault Folder Sync: 已重置为默认的 Windows 文件名兼容规则。",
-							);
-						}),
-				);
-		};
-		renderRules();
-
 		containerEl.createEl("h3", { text: "同步目标目录" });
 
 		this.plugin.settings.targets.forEach((target) => {
@@ -882,6 +801,87 @@ class VaultFolderSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 		createLogView(containerEl, this.app);
+
+		containerEl.createEl("h3", { text: "Windows 文件名兼容" });
+		new Setting(containerEl)
+			.setName("文件名字符替换规则")
+			.setDesc(
+				"在同步到目标目录时，将文件名中的特殊字符替换为 Windows 支持的字符；反向同步时会自动反向映射。下面每一行是一条规则：左边是源字符，右边是目标字符。",
+			);
+
+		const rulesContainer = containerEl.createEl("div");
+		const renderRules = () => {
+			rulesContainer.empty();
+			this.plugin.settings.filenameRules.forEach((rule, index) => {
+				const s = new Setting(rulesContainer)
+					.setName(`规则 ${index + 1}`)
+					.setDesc("源字符 => 目标字符")
+					.addText((text) =>
+						text
+							.setPlaceholder("源字符，例如 :")
+							.setValue(rule.from)
+							.onChange(async (value) => {
+								this.plugin.settings.filenameRules[index].from =
+									value;
+								await this.plugin.saveSettings();
+							}),
+					)
+					.addText((text) =>
+						text
+							.setPlaceholder("目标字符，例如 ：")
+							.setValue(rule.to)
+							.onChange(async (value) => {
+								this.plugin.settings.filenameRules[index].to =
+									value;
+								await this.plugin.saveSettings();
+							}),
+					)
+					.addExtraButton((button) =>
+						button
+							.setIcon("trash")
+							.setTooltip("删除该规则")
+							.onClick(async () => {
+								this.plugin.settings.filenameRules.splice(
+									index,
+									1,
+								);
+								await this.plugin.saveSettings();
+								renderRules();
+							}),
+					);
+				s.infoEl.style.whiteSpace = "pre-wrap";
+			});
+
+			new Setting(rulesContainer)
+				.setName("新增规则")
+				.setDesc("添加一条新的字符替换规则。")
+				.addButton((button) =>
+					button
+						.setButtonText("添加规则")
+						.onClick(async () => {
+							this.plugin.settings.filenameRules.push({
+								from: "",
+								to: "",
+							});
+							await this.plugin.saveSettings();
+							renderRules();
+						}),
+				)
+				.addButton((button) =>
+					button
+						.setButtonText("重置为默认规则")
+						.onClick(async () => {
+							this.plugin.settings.filenameRules =
+								DEFAULT_FILENAME_RULES.map((r) => ({ ...r }));
+							await this.plugin.saveSettings();
+							renderRules();
+							new Notice(
+								"Vault Folder Sync: 已重置为默认的 Windows 文件名兼容规则。",
+							);
+						}),
+				);
+		};
+		renderRules();
 	}
 }
 
