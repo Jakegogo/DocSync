@@ -22,6 +22,7 @@ import {
 } from "./filename-map";
 import {
 	logLocalSourceChange,
+	logLocalRename,
 	mergeLogsForTargets,
 	runReverseSyncForTargets,
 } from "./reverse-sync";
@@ -89,9 +90,10 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		const enabledTargetPaths = enabledTargets.map((t) => t.path);
 
 		mergeLogsForTargets(sourceRoot, enabledTargetPaths)
+			// 如果开启了反向同步，先尝试从对端拉回变更，再做正向/校验
+			.then(() => this.runReverseSyncOnce(sourceRoot))
 			.then(() => this.triggerSync(false))
 			.then(() => this.verifyTargetsByMtime(sourceRoot, enabledTargets))
-			.then(() => this.runReverseSyncOnce(sourceRoot))
 			.then(() => {
 				// 启动时如果没有冲突文件，则关闭已有的冲突面板
 				closeDiffViewIfNoConflicts(this.app);
@@ -115,8 +117,17 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		await mergeLogsForTargets(sourceRoot, enabledTargetPaths);
 
 		if (this.isSyncing) return;
-		await this.triggerSync(false);
-		await this.runReverseSyncOnce(sourceRoot);
+		// 如果当前 vault 有本地待同步变更（包含重命名），优先向目标推送，再尝试从目标拉回；
+		// 否则按「先反向、后正向」的顺序处理仅目标侧的变更。
+		const hasLocalChanges =
+			this.changedFiles.size > 0 || this.pendingRenames.length > 0;
+		if (hasLocalChanges) {
+			await this.triggerSync(false);
+			await this.runReverseSyncOnce(sourceRoot);
+		} else {
+			await this.runReverseSyncOnce(sourceRoot);
+			await this.triggerSync(false);
+		}
 	}
 
 	onunload() {
@@ -163,6 +174,7 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				this.markRename(oldPath, file.path);
+				logLocalRename(this.app, oldPath, file.path).catch(() => {});
 			}),
 		);
 	}

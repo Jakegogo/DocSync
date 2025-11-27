@@ -6,8 +6,9 @@ import {
 	runReverseSyncForTargets,
 	logLocalSourceChange,
 	mergeLogsForTargets,
+	logLocalRename,
 } from "../reverse-sync";
-import { WorkspaceLeaf } from "obsidian";
+import { WorkspaceLeaf, FileSystemAdapter } from "obsidian";
 
 function createTempDir(prefix: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -64,10 +65,21 @@ function appendSourceModificationLog(
 	fs.appendFileSync(logPath, JSON.stringify(entry) + "\n", "utf8");
 }
 
-function createFakeApp(sourceRoot: string): any {
-	const adapter = {
-		getBasePath: () => sourceRoot,
+function appendSourceDeletionLog(sourceRoot: string, relPath: string) {
+	// 保留该辅助函数以便在需要时直接写入删除日志，目前主路径使用 logLocalSourceChange。
+	const logPath = getLogPath(sourceRoot);
+	fs.mkdirSync(path.dirname(logPath), { recursive: true });
+	const entry = {
+		relPath,
+		deletedAt: new Date().toISOString(),
+		side: "source",
+		event: "deleted",
 	};
+	fs.appendFileSync(logPath, JSON.stringify(entry) + "\n", "utf8");
+}
+
+function createFakeApp(sourceRoot: string): any {
+	const adapter = new (FileSystemAdapter as any)(sourceRoot);
 	return {
 		vault: {
 			adapter,
@@ -285,6 +297,119 @@ describe("VaultFolderSync forward and reverse sync", () => {
 
 		// 合并后，本端日志中应包含该冲突文件的记录
 		expect(logA).toContain(relPath);
+	});
+
+	it("logs rename as paired deleted and modified entries with rename metadata", async () => {
+		const sourceRoot = createTempDir("vfs-rename-log-");
+		const app = createFakeApp(sourceRoot);
+
+		const fromRel = "old-name.md";
+		const toRel = "new-name.md";
+
+		await logLocalRename(app as any, fromRel, toRel);
+
+		const logPath = getLogPath(sourceRoot);
+		const text = fs.existsSync(logPath)
+			? fs.readFileSync(logPath, "utf8")
+			: "";
+		const lines = text
+			.split(/\r?\n/)
+			.map((l) => l.trim())
+			.filter(Boolean);
+
+		expect(lines.length).toBe(2);
+		const entries = lines.map((l) => JSON.parse(l));
+
+		const delEntry = entries.find(
+			(e) => e.relPath === fromRel && e.event === "deleted",
+		);
+		const modEntry = entries.find(
+			(e) => e.relPath === toRel && e.event === "modified",
+		);
+
+		expect(delEntry).toBeTruthy();
+		expect(modEntry).toBeTruthy();
+		expect(delEntry.rename).toBe(true);
+		expect(modEntry.rename).toBe(true);
+		expect(delEntry.renameTo).toBe(toRel);
+		expect(modEntry.renameFrom).toBe(fromRel);
+		expect(delEntry.renameId).toBe(modEntry.renameId);
+	});
+
+	it("removes old target file after a rename from source", async () => {
+		const sourceRoot = createTempDir("vfs-rename-src-");
+		const targetRoot = createTempDir("vfs-rename-tgt-");
+
+		const fromRel = "old-note.md";
+		const toRel = "new-note.md";
+		const sourceOld = path.join(sourceRoot, fromRel);
+		const sourceNew = path.join(sourceRoot, toRel);
+		const targetOld = path.join(targetRoot, fromRel);
+		const targetNew = path.join(targetRoot, toRel);
+
+		// 初始：源创建旧文件并全量同步到目标
+		writeFile(sourceOld, "old-content");
+		const app = createFakeApp(sourceRoot);
+		const plugin: any = new (VaultFolderSyncPlugin as any)(app);
+		const target: any = {
+			id: "t1",
+			path: targetRoot,
+			enabled: true,
+			lastFullSyncDone: false,
+		};
+		await plugin.fullSyncTarget(sourceRoot, target);
+		expect(fs.existsSync(targetOld)).toBe(true);
+		expect(readFile(targetOld)).toBe("old-content");
+
+		// 源侧重命名文件，并记录重命名日志与内部重命名队列
+		fs.renameSync(sourceOld, sourceNew);
+		await logLocalRename(app as any, fromRel, toRel);
+		plugin.markRename(fromRel, toRel);
+
+		// 增量同步应在目标目录执行真正的重命名，并移除旧文件名
+		await plugin.incrementalSyncTarget(sourceRoot, target);
+
+		expect(fs.existsSync(targetOld)).toBe(false);
+		expect(fs.existsSync(targetNew)).toBe(true);
+		expect(readFile(targetNew)).toBe("old-content");
+	});
+
+	it("does not resurrect a file deleted in source when reverse sync runs before forward sync", async () => {
+		const sourceRoot = createTempDir("vfs-del-src-");
+		const targetRoot = createTempDir("vfs-del-tgt-");
+
+		const relPath = "to-delete.md";
+		const sourceFile = path.join(sourceRoot, relPath);
+		const targetFile = path.join(targetRoot, relPath);
+
+		// 初始：源创建文件并全量同步到目标
+		writeFile(sourceFile, "to-be-deleted");
+		const app = createFakeApp(sourceRoot);
+		const plugin: any = new (VaultFolderSyncPlugin as any)(app);
+		const target: any = {
+			id: "t1",
+			path: targetRoot,
+			enabled: true,
+			lastFullSyncDone: false,
+		};
+		await plugin.fullSyncTarget(sourceRoot, target);
+		expect(fs.existsSync(targetFile)).toBe(true);
+
+		// 源侧删除该文件，并记录删除日志
+		fs.unlinkSync(sourceFile);
+		appendSourceDeletionLog(sourceRoot, relPath);
+
+		// 模拟一次周期任务顺序：merge 日志 → 先反向同步 → 再正向同步
+		await mergeLogsForTargets(sourceRoot, [targetRoot]);
+		await runReverseSyncForTargets(app as any, sourceRoot, [targetRoot]);
+
+		// 反向同步不应从目标恢复源文件
+		expect(fs.existsSync(sourceFile)).toBe(false);
+
+		// 正向增量同步应最终删除目标文件
+		plugin.changedFiles.set(relPath, "deleted");
+		await plugin.incrementalSyncTarget(sourceRoot, target);
+		expect(fs.existsSync(targetFile)).toBe(false);
 	});
 });
 

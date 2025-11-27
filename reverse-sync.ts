@@ -319,6 +319,52 @@ export async function logLocalSourceChange(
 	await fs.promises.appendFile(logPath, line + "\n", "utf8");
 }
 
+export async function logLocalRename(
+	app: App,
+	fromRelPath: string,
+	toRelPath: string,
+) {
+	const adapter = app.vault.adapter;
+	if (!(adapter instanceof FileSystemAdapter)) return;
+	const root = adapter.getBasePath();
+	const logPath = getDeletionLogPath(root);
+
+	const nowIso = new Date().toISOString();
+	const renameId = `${nowIso}-${Math.random().toString(36).slice(2, 8)}`;
+
+	const deletedEntry: RawLogEntry = {
+		relPath: fromRelPath,
+		side: "source",
+		event: "deleted",
+		deletedAt: nowIso,
+		merged: false,
+		resolved: false,
+		rename: true,
+		renameTo: toRelPath,
+		renameId,
+	};
+
+	const createdEntry: RawLogEntry = {
+		relPath: toRelPath,
+		side: "source",
+		event: "modified",
+		modifiedAt: nowIso,
+		merged: false,
+		resolved: false,
+		rename: true,
+		renameFrom: fromRelPath,
+		renameId,
+	};
+
+	await ensureDir(path.dirname(logPath));
+	const text =
+		JSON.stringify(deletedEntry) +
+		"\n" +
+		JSON.stringify(createdEntry) +
+		"\n";
+	await fs.promises.appendFile(logPath, text, "utf8");
+}
+
 function getDeletionLogPath(sourceRoot: string): string {
 	return path.join(
 		sourceRoot,
@@ -519,6 +565,16 @@ interface LatestEvents {
 	targetDeleted?: RawLogEntry;
 }
 
+type ReverseActionType = "copyTargetToSource" | "conflict";
+
+interface ReverseSyncAction {
+	type: ReverseActionType;
+	relPath: string;
+	sourcePath: string;
+	targetPath: string;
+	targetMtimeMs?: number;
+}
+
 function getLatestUnresolvedEventsFor(relPath: string): LatestEvents {
 	const result: LatestEvents = {};
 	for (const e of currentRawLogEntries) {
@@ -607,6 +663,8 @@ async function traverseTargetAndSync(
 	targetRoot: string,
 	perTargetLog: { [relPath: string]: string },
 ) {
+	const actions: ReverseSyncAction[] = [];
+
 	async function walk(currentTargetDir: string) {
 		const relDir = path.relative(targetRoot, currentTargetDir);
 		const sourceDir =
@@ -635,20 +693,26 @@ async function traverseTargetAndSync(
 				);
 				const tgtStat = await fs.promises.stat(targetPath);
 
-				// 目标新增文件：直接拷贝到源目录
 				if (!srcStat || !srcStat.isFile()) {
-					await ensureDir(path.dirname(sourcePath));
-					await copyFileWithMetadata(targetPath, sourcePath);
-					delete perTargetLog[relPath];
-					// 记录修改日志，表示该文件最后一次由目标写回源
-					await appendModificationLogEntry(
-						getDeletionLogPath(sourceRoot),
-						{
-							targetRoot,
-							relPath,
-							modifiedAt: new Date(tgtStat.mtimeMs).toISOString(),
-						},
+					// 源端已不存在该文件，先检查是否存在“源侧删除”事件，避免误恢复
+					const latestForDeletion = getLatestUnresolvedEventsFor(
+						relPath,
 					);
+					const deletionEntry = latestForDeletion.sourceDeleted;
+					if (deletionEntry) {
+						// 一旦存在未解决的源侧删除事件，则视为“用户更倾向于删除”，
+						// 此处不从目标恢复，让后续正向同步传播删除到目标。
+						continue;
+					}
+
+					// 目标新增文件：直接拷贝到源目录
+					actions.push({
+						type: "copyTargetToSource",
+						relPath,
+						sourcePath,
+						targetPath,
+						targetMtimeMs: tgtStat.mtimeMs,
+					});
 					continue;
 				}
 
@@ -668,44 +732,32 @@ async function traverseTargetAndSync(
 					// 目标文件比源文件新
 					if (hasSourceChange && hasTargetChange) {
 						// 双方都有未处理变更，视为冲突
-						new Notice(
-							`Vault Folder Sync: 反向同步冲突（两端均有修改）：${relPath}`,
-						);
-						await openDiffForConflict(
-							app,
+						actions.push({
+							type: "conflict",
 							relPath,
 							sourcePath,
 							targetPath,
-						);
+						});
 					} else {
 						// 只有目标侧有变更，安全地反向覆盖源文件
-						await ensureDir(path.dirname(sourcePath));
-						await copyFileWithMetadata(targetPath, sourcePath);
-						delete perTargetLog[relPath];
-						await appendModificationLogEntry(
-							getDeletionLogPath(sourceRoot),
-							{
-								targetRoot,
-								relPath,
-								modifiedAt: new Date(
-									tgtStat.mtimeMs,
-								).toISOString(),
-							},
-						);
+						actions.push({
+							type: "copyTargetToSource",
+							relPath,
+							sourcePath,
+							targetPath,
+							targetMtimeMs: tgtStat.mtimeMs,
+						});
 					}
 				} else {
 					// 源文件比目标文件新
 					if (hasSourceChange && hasTargetChange) {
 						// 双方都有未处理变更，视为冲突
-						new Notice(
-							`Vault Folder Sync: 反向同步冲突（两端均有修改）：${relPath}`,
-						);
-						await openDiffForConflict(
-							app,
+						actions.push({
+							type: "conflict",
 							relPath,
 							sourcePath,
 							targetPath,
-						);
+						});
 					}
 					// 其他情况（仅源侧有变更或仅目标较旧）保留现状，交给正向同步处理
 				}
@@ -714,6 +766,42 @@ async function traverseTargetAndSync(
 	}
 
 	await walk(targetRoot);
+
+	// 统一执行计划：先执行所有拷贝，再处理冲突展示，避免执行过程中再改变判断依据
+	for (const action of actions) {
+		if (action.type === "copyTargetToSource") {
+			const { relPath, sourcePath, targetPath, targetMtimeMs } = action;
+			try {
+				await ensureDir(path.dirname(sourcePath));
+				await copyFileWithMetadata(targetPath, sourcePath);
+				delete perTargetLog[relPath];
+				if (typeof targetMtimeMs === "number") {
+					await appendModificationLogEntry(
+						getDeletionLogPath(sourceRoot),
+						{
+							targetRoot,
+							relPath,
+							modifiedAt: new Date(
+								targetMtimeMs,
+							).toISOString(),
+						},
+					);
+				}
+			} catch (err) {
+				console.error(
+					"Vault Folder Sync: reverse copy failed for",
+					relPath,
+					err,
+				);
+			}
+		} else if (action.type === "conflict") {
+			const { relPath, sourcePath, targetPath } = action;
+			new Notice(
+				`Vault Folder Sync: 反向同步冲突（两端均有修改）：${relPath}`,
+			);
+			await openDiffForConflict(app, relPath, sourcePath, targetPath);
+		}
+	}
 }
 
 async function handleDeletions(
@@ -796,6 +884,16 @@ async function handleSingleDeletion(
 
 	const nowIso = new Date().toISOString();
 	const existing = perTargetLog[relPath];
+
+	// 如果源侧最近有修改/重命名/删除事件，而目标侧没有明确的删除事件，
+	// 则认为本端为主，不应因为目标缺少该文件而驱动删除源文件，交给正向同步处理。
+	const latestEvents = getLatestUnresolvedEventsFor(relPath);
+	const hasSourceChange =
+		!!latestEvents.sourceModified || !!latestEvents.sourceDeleted;
+	const hasTargetDelete = !!latestEvents.targetDeleted;
+	if (hasSourceChange && !hasTargetDelete) {
+		return;
+	}
 
 	if (!existing) {
 		// 第一次发现目标已删除，先记录一次删除时间，下次再判断是否真正删除源文件

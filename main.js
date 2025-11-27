@@ -929,6 +929,39 @@ async function logLocalSourceChange(app, relPath, kind) {
   const line = JSON.stringify(entry);
   await fs3.promises.appendFile(logPath, line + "\n", "utf8");
 }
+async function logLocalRename(app, fromRelPath, toRelPath) {
+  const adapter = app.vault.adapter;
+  if (!(adapter instanceof import_obsidian3.FileSystemAdapter)) return;
+  const root = adapter.getBasePath();
+  const logPath = getDeletionLogPath(root);
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const renameId = `${nowIso}-${Math.random().toString(36).slice(2, 8)}`;
+  const deletedEntry = {
+    relPath: fromRelPath,
+    side: "source",
+    event: "deleted",
+    deletedAt: nowIso,
+    merged: false,
+    resolved: false,
+    rename: true,
+    renameTo: toRelPath,
+    renameId
+  };
+  const createdEntry = {
+    relPath: toRelPath,
+    side: "source",
+    event: "modified",
+    modifiedAt: nowIso,
+    merged: false,
+    resolved: false,
+    rename: true,
+    renameFrom: fromRelPath,
+    renameId
+  };
+  await ensureDir(path4.dirname(logPath));
+  const text = JSON.stringify(deletedEntry) + "\n" + JSON.stringify(createdEntry) + "\n";
+  await fs3.promises.appendFile(logPath, text, "utf8");
+}
 function getDeletionLogPath(sourceRoot) {
   return path4.join(
     sourceRoot,
@@ -1125,6 +1158,7 @@ async function syncOneTarget(app, sourceRoot, targetRoot, log, logPath) {
   return log;
 }
 async function traverseTargetAndSync(app, sourceRoot, targetRoot, perTargetLog) {
+  const actions = [];
   async function walk(currentTargetDir) {
     const relDir = path4.relative(targetRoot, currentTargetDir);
     const sourceDir = relDir === "" ? sourceRoot : path4.join(sourceRoot, relDir);
@@ -1147,17 +1181,20 @@ async function traverseTargetAndSync(app, sourceRoot, targetRoot, perTargetLog) 
         );
         const tgtStat = await fs3.promises.stat(targetPath);
         if (!srcStat || !srcStat.isFile()) {
-          await ensureDir(path4.dirname(sourcePath));
-          await copyFileWithMetadata(targetPath, sourcePath);
-          delete perTargetLog[relPath];
-          await appendModificationLogEntry(
-            getDeletionLogPath(sourceRoot),
-            {
-              targetRoot,
-              relPath,
-              modifiedAt: new Date(tgtStat.mtimeMs).toISOString()
-            }
+          const latestForDeletion = getLatestUnresolvedEventsFor(
+            relPath
           );
+          const deletionEntry = latestForDeletion.sourceDeleted;
+          if (deletionEntry) {
+            continue;
+          }
+          actions.push({
+            type: "copyTargetToSource",
+            relPath,
+            sourcePath,
+            targetPath,
+            targetMtimeMs: tgtStat.mtimeMs
+          });
           continue;
         }
         const diff2 = Math.abs(tgtStat.mtimeMs - srcStat.mtimeMs);
@@ -1169,47 +1206,69 @@ async function traverseTargetAndSync(app, sourceRoot, targetRoot, perTargetLog) 
         const hasTargetChange = !!latest.targetModified || !!latest.targetDeleted;
         if (tgtStat.mtimeMs > srcStat.mtimeMs + MTIME_EPS_MS) {
           if (hasSourceChange && hasTargetChange) {
-            new import_obsidian3.Notice(
-              `Vault Folder Sync: \u53CD\u5411\u540C\u6B65\u51B2\u7A81\uFF08\u4E24\u7AEF\u5747\u6709\u4FEE\u6539\uFF09\uFF1A${relPath}`
-            );
-            await openDiffForConflict(
-              app,
+            actions.push({
+              type: "conflict",
               relPath,
               sourcePath,
               targetPath
-            );
+            });
           } else {
-            await ensureDir(path4.dirname(sourcePath));
-            await copyFileWithMetadata(targetPath, sourcePath);
-            delete perTargetLog[relPath];
-            await appendModificationLogEntry(
-              getDeletionLogPath(sourceRoot),
-              {
-                targetRoot,
-                relPath,
-                modifiedAt: new Date(
-                  tgtStat.mtimeMs
-                ).toISOString()
-              }
-            );
+            actions.push({
+              type: "copyTargetToSource",
+              relPath,
+              sourcePath,
+              targetPath,
+              targetMtimeMs: tgtStat.mtimeMs
+            });
           }
         } else {
           if (hasSourceChange && hasTargetChange) {
-            new import_obsidian3.Notice(
-              `Vault Folder Sync: \u53CD\u5411\u540C\u6B65\u51B2\u7A81\uFF08\u4E24\u7AEF\u5747\u6709\u4FEE\u6539\uFF09\uFF1A${relPath}`
-            );
-            await openDiffForConflict(
-              app,
+            actions.push({
+              type: "conflict",
               relPath,
               sourcePath,
               targetPath
-            );
+            });
           }
         }
       }
     }
   }
   await walk(targetRoot);
+  for (const action of actions) {
+    if (action.type === "copyTargetToSource") {
+      const { relPath, sourcePath, targetPath, targetMtimeMs } = action;
+      try {
+        await ensureDir(path4.dirname(sourcePath));
+        await copyFileWithMetadata(targetPath, sourcePath);
+        delete perTargetLog[relPath];
+        if (typeof targetMtimeMs === "number") {
+          await appendModificationLogEntry(
+            getDeletionLogPath(sourceRoot),
+            {
+              targetRoot,
+              relPath,
+              modifiedAt: new Date(
+                targetMtimeMs
+              ).toISOString()
+            }
+          );
+        }
+      } catch (err) {
+        console.error(
+          "Vault Folder Sync: reverse copy failed for",
+          relPath,
+          err
+        );
+      }
+    } else if (action.type === "conflict") {
+      const { relPath, sourcePath, targetPath } = action;
+      new import_obsidian3.Notice(
+        `Vault Folder Sync: \u53CD\u5411\u540C\u6B65\u51B2\u7A81\uFF08\u4E24\u7AEF\u5747\u6709\u4FEE\u6539\uFF09\uFF1A${relPath}`
+      );
+      await openDiffForConflict(app, relPath, sourcePath, targetPath);
+    }
+  }
 }
 async function handleDeletions(app, sourceRoot, targetRoot, perTargetLog, logPath) {
   async function walkSourceDir(currentSourceDir) {
@@ -1268,6 +1327,12 @@ async function handleSingleDeletion(app, sourcePath, relPath, perTargetLog, logP
   }
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   const existing = perTargetLog[relPath];
+  const latestEvents = getLatestUnresolvedEventsFor(relPath);
+  const hasSourceChange = !!latestEvents.sourceModified || !!latestEvents.sourceDeleted;
+  const hasTargetDelete = !!latestEvents.targetDeleted;
+  if (hasSourceChange && !hasTargetDelete) {
+    return;
+  }
   if (!existing) {
     perTargetLog[relPath] = nowIso;
     await appendDeletionLogEntry(logPath, {
@@ -1297,9 +1362,9 @@ async function handleSingleDeletion(app, sourcePath, relPath, perTargetLog, logP
     });
   } else {
     const latest = getLatestUnresolvedEventsFor(relPath);
-    const hasSourceChange = !!latest.sourceModified || !!latest.sourceDeleted;
+    const hasSourceChange2 = !!latest.sourceModified || !!latest.sourceDeleted;
     const hasTargetChange = !!latest.targetModified || !!latest.targetDeleted;
-    if (hasSourceChange && hasTargetChange) {
+    if (hasSourceChange2 && hasTargetChange) {
       new import_obsidian3.Notice(
         `Vault Folder Sync: \u53CD\u5411\u540C\u6B65\u5220\u9664\u51B2\u7A81\uFF08\u4E24\u7AEF\u5747\u6709\u4FEE\u6539/\u5220\u9664\uFF09\uFF1A${relPath}`
       );
@@ -1400,7 +1465,7 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
       (t) => t.enabled && t.path.trim().length > 0
     );
     const enabledTargetPaths = enabledTargets.map((t) => t.path);
-    mergeLogsForTargets(sourceRoot, enabledTargetPaths).then(() => this.triggerSync(false)).then(() => this.verifyTargetsByMtime(sourceRoot, enabledTargets)).then(() => this.runReverseSyncOnce(sourceRoot)).then(() => {
+    mergeLogsForTargets(sourceRoot, enabledTargetPaths).then(() => this.runReverseSyncOnce(sourceRoot)).then(() => this.triggerSync(false)).then(() => this.verifyTargetsByMtime(sourceRoot, enabledTargets)).then(() => {
       closeDiffViewIfNoConflicts(this.app);
     }).catch((err) => {
       console.error("Initial sync error:", err);
@@ -1417,8 +1482,14 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
     const enabledTargetPaths = enabledTargets.map((t) => t.path);
     await mergeLogsForTargets(sourceRoot, enabledTargetPaths);
     if (this.isSyncing) return;
-    await this.triggerSync(false);
-    await this.runReverseSyncOnce(sourceRoot);
+    const hasLocalChanges = this.changedFiles.size > 0 || this.pendingRenames.length > 0;
+    if (hasLocalChanges) {
+      await this.triggerSync(false);
+      await this.runReverseSyncOnce(sourceRoot);
+    } else {
+      await this.runReverseSyncOnce(sourceRoot);
+      await this.triggerSync(false);
+    }
   }
   onunload() {
     this.triggerSync(false).catch((err) => {
@@ -1460,6 +1531,8 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         this.markRename(oldPath, file.path);
+        logLocalRename(this.app, oldPath, file.path).catch(() => {
+        });
       })
     );
   }
