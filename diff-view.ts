@@ -2,7 +2,9 @@ import {
 	App,
 	FileSystemAdapter,
 	ItemView,
+	MarkdownView,
 	Plugin,
+	TFile,
 	WorkspaceLeaf,
 } from "obsidian";
 import * as fs from "fs";
@@ -104,6 +106,10 @@ export class VaultFolderSyncDiffView extends ItemView {
 		prevBtn.disabled = total <= 1;
 		nextBtn.disabled = total <= 1;
 		resolveBtn.disabled = !current;
+		resolveBtn.setAttr(
+			"title",
+			"标记该文件冲突已解决，并默认以当前 Vault（源目录）中的内容为准覆盖目标目录。",
+		);
 
 		prevBtn.onclick = () => {
 			if (conflictEntries.length === 0) return;
@@ -122,6 +128,38 @@ export class VaultFolderSyncDiffView extends ItemView {
 
 		resolveBtn.onclick = async () => {
 			if (!current) return;
+
+			// 默认采用源 vault（当前打开目录）的文件为准：
+			// 如果存在目标路径，则直接用源文件覆盖目标文件。
+			if (current.targetPath) {
+				try {
+					const stat = await fs.promises.stat(current.sourcePath).catch(
+						() => null,
+					);
+					if (stat && stat.isFile()) {
+						await ensureDirForView(path.dirname(current.targetPath));
+						await fs.promises.copyFile(
+							current.sourcePath,
+							current.targetPath,
+						);
+						// 尽量保留原有的时间戳信息，方便后续基于 mtime 的判断
+						await fs.promises
+							.utimes(
+								current.targetPath,
+								stat.atime,
+								stat.mtime,
+							)
+							.catch(() => {});
+					}
+				} catch (err) {
+					console.error(
+						"Vault Folder Sync: failed to resolve conflict by keeping source file for",
+						current.relPath,
+						err,
+					);
+				}
+			}
+
 			await markConflictResolved(this.app, current.relPath);
 			conflictEntries = conflictEntries.filter(
 				(e) => e.relPath !== current.relPath,
@@ -138,14 +176,60 @@ export class VaultFolderSyncDiffView extends ItemView {
 		});
 		pre.style.flex = "1 1 auto";
 		pre.style.width = "100%";
-		pre.style.whiteSpace = "pre-wrap";
+		pre.style.whiteSpace = "pre";
 		pre.style.fontFamily = "var(--font-monospace)";
 		pre.style.overflowY = "auto";
-		if (current) {
-			pre.setText(current.patch || "(无差异或无法加载内容)");
+
+		if (current && current.patch) {
+			this.renderPatchWithNavigation(pre, current);
+		} else if (current) {
+			pre.setText("(无差异或无法加载内容)");
 		} else {
 			pre.setText("(当前没有可显示的冲突 diff)");
 		}
+	}
+
+	private renderPatchWithNavigation(
+		pre: HTMLElement,
+		conflict: ConflictEntry,
+	) {
+		const lines = conflict.patch.split(/\r?\n/);
+		const sourceLineMap = buildSourceLineMap(lines);
+
+		pre.empty();
+
+		for (let i = 0; i < lines.length; i++) {
+			const lineText = lines[i];
+			const span = pre.createSpan({
+				text: lineText === "" ? " " : lineText,
+			});
+			span.addClass("vault-folder-sync-diff-line");
+			span.setAttr("data-line-index", String(i));
+
+			const srcLine = sourceLineMap[i];
+			if (typeof srcLine === "number") {
+				span.setAttr("data-source-line", String(srcLine));
+			}
+
+			// 每行后面补一个换行，保持 diff 视觉结构
+			pre.createEl("br");
+		}
+
+		pre.onclick = (ev: MouseEvent) => {
+			const target = ev.target as HTMLElement | null;
+			if (!target) return;
+			const lineEl = target.closest(
+				".vault-folder-sync-diff-line",
+			) as HTMLElement | null;
+			if (!lineEl) return;
+
+			const sourceLineAttr = lineEl.getAttr("data-source-line");
+			if (!sourceLineAttr) return;
+			const sourceLine = Number(sourceLineAttr);
+			if (!Number.isFinite(sourceLine) || sourceLine <= 0) return;
+
+			scrollVaultToSourceLine(this.app, conflict.relPath, sourceLine);
+		};
 	}
 }
 
@@ -195,26 +279,40 @@ export async function openDiffForConflict(
 	}
 
 	// 始终复用同一个 diff 叶子，确保同一时间只存在一个 diff 标签
-	const leaves = app.workspace.getLeavesOfType(DIFF_VIEW_TYPE);
-	let leaf: WorkspaceLeaf;
-	if (leaves.length > 0) {
-		// 关闭多余的 diff 叶子，只保留一个
-		for (let i = 1; i < leaves.length; i++) {
-			leaves[i].detach();
+	let leaf: WorkspaceLeaf | null = null;
+	try {
+		const leaves = app.workspace.getLeavesOfType(DIFF_VIEW_TYPE);
+		if (leaves.length > 0) {
+			// 关闭多余的 diff 叶子，只保留一个
+			for (let i = 1; i < leaves.length; i++) {
+				leaves[i].detach();
+			}
+			leaf = leaves[0];
+		} else {
+			// 某些启动早期阶段，getRightLeaf 内部可能因为工作区尚未完全初始化而抛错，
+			// 这里用 try/catch 包裹，避免影响整体同步流程。
+			const maybeLeaf = app.workspace.getRightLeaf(false);
+			if (!maybeLeaf) {
+				return;
+			}
+			leaf = maybeLeaf;
 		}
-		leaf = leaves[0];
-	} else {
-		leaf = app.workspace.getRightLeaf(false);
-	}
 
-	await leaf.setViewState({
-		type: DIFF_VIEW_TYPE,
-		active: true,
-		state: {
-			index: currentConflictIndex,
-		},
-	});
-	app.workspace.revealLeaf(leaf);
+		await leaf.setViewState({
+			type: DIFF_VIEW_TYPE,
+			active: true,
+			state: {
+				index: currentConflictIndex,
+			},
+		});
+		app.workspace.revealLeaf(leaf);
+	} catch (err) {
+		console.error(
+			"Vault Folder Sync: failed to open conflict diff view",
+			err,
+		);
+		// 打不开 diff 面板不应中断同步流程，这里吞掉异常即可。
+	}
 }
 
 export function closeDiffViewIfNoConflicts(app: App) {
@@ -286,6 +384,65 @@ async function readRawLogEntriesForView(
 
 async function ensureDirForView(dirPath: string) {
 	await fs.promises.mkdir(dirPath, { recursive: true });
+}
+
+function buildSourceLineMap(lines: string[]): Array<number | null> {
+	const map: Array<number | null> = new Array(lines.length).fill(null);
+	let origLine = 0;
+
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (line.startsWith("@@")) {
+			// 解析 hunk 头，更新源文件起始行号
+			const m = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+			if (m) {
+				origLine = Number(m[1]);
+			}
+			continue;
+		}
+
+		if (!origLine) continue;
+
+		const prefix = line[0];
+		if (prefix === " " || prefix === "-") {
+			map[i] = origLine;
+			origLine += 1;
+		} else if (prefix === "+") {
+			// 插入行：近似映射到插入位置附近的源文件行
+			map[i] = origLine > 0 ? origLine : null;
+		}
+	}
+
+	return map;
+}
+
+async function scrollVaultToSourceLine(
+	app: App,
+	relPath: string,
+	sourceLine: number,
+) {
+	const file = app.vault.getAbstractFileByPath(relPath);
+	if (!(file instanceof TFile)) return;
+
+	const leaf = app.workspace.getLeaf(false);
+	if (!leaf) return;
+
+	await leaf.openFile(file);
+
+	const view = app.workspace.getActiveViewOfType(MarkdownView);
+	if (!view) return;
+
+	const editor = view.editor;
+	const maxLine = editor.lineCount() - 1;
+	const lineIndex = Math.max(0, Math.min(maxLine, sourceLine - 1));
+
+	editor.setCursor({ line: lineIndex, ch: 0 });
+
+	// 滚动到对应行附近，中心显示
+	const from = { line: lineIndex, ch: 0 };
+	const to = { line: Math.min(maxLine, lineIndex + 1), ch: 0 };
+	// 部分版本 Editor.scrollIntoView 的类型签名不一致，这里宽松处理
+	(editor as any).scrollIntoView({ from, to }, true);
 }
 
 

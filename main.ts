@@ -10,6 +10,7 @@ import {
 } from "obsidian";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 import { closeDiffViewIfNoConflicts, registerDiffView } from "./diff-view";
 import { createLogView } from "./log-view";
 import {
@@ -39,6 +40,8 @@ interface VaultFolderSyncSettings {
 	targets: SyncTarget[];
 	syncIntervalSeconds: number;
 	filenameRules: FilenameMappingRule[];
+	currentDeviceId?: string;
+	deviceTargets?: Record<string, SyncTarget[]>;
 }
 
 const DEFAULT_SETTINGS: VaultFolderSyncSettings = {
@@ -61,18 +64,32 @@ export default class VaultFolderSyncPlugin extends Plugin {
 	private pendingRenames: RenameChange[] = [];
 	private isSyncing = false;
 	private statusBarItem: HTMLElement | null = null;
+	private isReverseSyncing = false;
 
 	async onload() {
 		await this.loadSettings();
 
 		registerDiffView(this);
 
-		this.statusBarItem = this.addStatusBarItem();
-		this.setStatusSyncing();
-
 		this.registerVaultEvents();
 		this.registerCommands();
 		this.addSettingTab(new VaultFolderSyncSettingTab(this.app, this));
+
+		// 当前设备下是否配置了至少一个有效的同步目标目录
+		const sourceRoot = this.getVaultRootPath();
+		const enabledTargets = this.getCurrentDeviceTargets().filter(
+			(t) => t.enabled && t.path.trim().length > 0,
+		);
+
+		if (enabledTargets.length === 0) {
+			// 没有同步目录：不展示状态栏、不执行任何同步逻辑，但仍然会记录本地修改/删除日志，
+			// 以便未来在其它有同步目录的设备上进行合并和反向同步。
+			return;
+		}
+
+		// 只有在存在同步目录时，才显示状态栏和定时同步
+		this.statusBarItem = this.addStatusBarItem();
+		this.setStatusSyncing();
 
 		// 定时增量同步
 		const intervalMs = (this.settings.syncIntervalSeconds || 30) * 1000;
@@ -83,10 +100,6 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		);
 
 		// 启动时先根据标记文件做一次全量/增量同步，然后再做一次基于 mtime 的全面校验
-		const sourceRoot = this.getVaultRootPath();
-		const enabledTargets = this.settings.targets.filter(
-			(t) => t.enabled && t.path.trim().length > 0,
-		);
 		const enabledTargetPaths = enabledTargets.map((t) => t.path);
 
 		mergeLogsForTargets(sourceRoot, enabledTargetPaths)
@@ -108,25 +121,33 @@ export default class VaultFolderSyncPlugin extends Plugin {
 
 	private async runPeriodicSync() {
 		const sourceRoot = this.getVaultRootPath();
-		const enabledTargets = this.settings.targets.filter(
+		const enabledTargets = this.getCurrentDeviceTargets().filter(
 			(t) => t.path.trim().length > 0,
 		);
+		if (enabledTargets.length === 0) return;
 		const enabledTargetPaths = enabledTargets.map((t) => t.path);
 
-		// 日志 merge 先于文件同步
-		await mergeLogsForTargets(sourceRoot, enabledTargetPaths);
+		try {
+			// 日志 merge 先于文件同步
+			await mergeLogsForTargets(sourceRoot, enabledTargetPaths);
 
-		if (this.isSyncing) return;
-		// 如果当前 vault 有本地待同步变更（包含重命名），优先向目标推送，再尝试从目标拉回；
-		// 否则按「先反向、后正向」的顺序处理仅目标侧的变更。
-		const hasLocalChanges =
-			this.changedFiles.size > 0 || this.pendingRenames.length > 0;
-		if (hasLocalChanges) {
-			await this.triggerSync(false);
-			await this.runReverseSyncOnce(sourceRoot);
-		} else {
-			await this.runReverseSyncOnce(sourceRoot);
-			await this.triggerSync(false);
+			if (this.isSyncing) return;
+			// 如果当前 vault 有本地待同步变更（包含重命名），优先向目标推送，再尝试从目标拉回；
+			// 否则按「先反向、后正向」的顺序处理仅目标侧的变更。
+			const hasLocalChanges =
+				this.changedFiles.size > 0 || this.pendingRenames.length > 0;
+			if (hasLocalChanges) {
+				await this.triggerSync(false);
+				await this.runReverseSyncOnce(sourceRoot);
+			} else {
+				await this.runReverseSyncOnce(sourceRoot);
+				await this.triggerSync(false);
+			}
+		} catch (err) {
+			console.error("Vault Folder Sync: periodic sync error:", err);
+			new Notice(
+				"Vault Folder Sync: 自动同步失败，请查看控制台日志。",
+			);
 		}
 	}
 
@@ -143,9 +164,13 @@ export default class VaultFolderSyncPlugin extends Plugin {
 			this.app.vault.on("create", (file) => {
 				if (file instanceof TFile) {
 					this.markFileChanged(file, "created");
-					logLocalSourceChange(this.app, file.path, "modified").catch(
-						() => {},
-					);
+					if (!this.isReverseSyncing) {
+						logLocalSourceChange(
+							this.app,
+							file.path,
+							"modified",
+						).catch(() => {});
+					}
 				}
 			}),
 		);
@@ -154,9 +179,13 @@ export default class VaultFolderSyncPlugin extends Plugin {
 			this.app.vault.on("modify", (file) => {
 				if (file instanceof TFile) {
 					this.markFileChanged(file, "modified");
-					logLocalSourceChange(this.app, file.path, "modified").catch(
-						() => {},
-					);
+					if (!this.isReverseSyncing) {
+						logLocalSourceChange(
+							this.app,
+							file.path,
+							"modified",
+						).catch(() => {});
+					}
 				}
 			}),
 		);
@@ -165,16 +194,24 @@ export default class VaultFolderSyncPlugin extends Plugin {
 			this.app.vault.on("delete", (file) => {
 				// delete 事件的 file 可能是 TFile 或 TFolder，路径相同处理
 				this.markPathDeleted(file.path);
-				logLocalSourceChange(this.app, file.path, "deleted").catch(
-					() => {},
-				);
+				if (!this.isReverseSyncing) {
+					logLocalSourceChange(
+						this.app,
+						file.path,
+						"deleted",
+					).catch(() => {});
+				}
 			}),
 		);
 
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				this.markRename(oldPath, file.path);
-				logLocalRename(this.app, oldPath, file.path).catch(() => {});
+				if (!this.isReverseSyncing) {
+					logLocalRename(this.app, oldPath, file.path).catch(
+						() => {},
+					);
+				}
 			}),
 		);
 	}
@@ -241,7 +278,7 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		this.isSyncing = true;
 		try {
 			const sourceRoot = this.getVaultRootPath();
-			const enabledTargets = this.settings.targets.filter(
+			const enabledTargets = this.getCurrentDeviceTargets().filter(
 				(t) => t.enabled && t.path.trim().length > 0,
 			);
 			if (enabledTargets.length === 0) {
@@ -269,9 +306,10 @@ export default class VaultFolderSyncPlugin extends Plugin {
 			this.setStatusSynced();
 		} catch (err) {
 			console.error("Vault Folder Sync error:", err);
-			if (manual) {
-				new Notice("Vault Folder Sync: 同步失败，请查看控制台日志。");
-			}
+			const prefix = manual ? "手动同步" : "自动同步";
+			new Notice(
+				`Vault Folder Sync: ${prefix}失败，请查看控制台日志。`,
+			);
 		} finally {
 			this.isSyncing = false;
 		}
@@ -584,22 +622,27 @@ export default class VaultFolderSyncPlugin extends Plugin {
 	}
 
 	private async runReverseSyncOnce(sourceRoot: string) {
-		const reverseTargets = this.settings.targets.filter(
+		const reverseTargets = this.getCurrentDeviceTargets().filter(
 			(t) => t.enabled && t.enableReverseSync && t.path.trim().length > 0,
 		);
 		if (reverseTargets.length === 0) return;
-		await runReverseSyncForTargets(
-			this.app,
-			sourceRoot,
-			reverseTargets.map((t) => t.path),
-		);
+		this.isReverseSyncing = true;
+		try {
+			await runReverseSyncForTargets(
+				this.app,
+				sourceRoot,
+				reverseTargets.map((t) => t.path),
+			);
+		} finally {
+			this.isReverseSyncing = false;
+		}
 	}
 
 	private setStatusPending() {
 		if (!this.statusBarItem) return;
 		this.statusBarItem.empty();
 		const iconSpan = this.statusBarItem.createSpan();
-		iconSpan.setText("●");
+		iconSpan.setText("⏳");
 		const textSpan = this.statusBarItem.createSpan();
 		textSpan.setText(" 待同步");
 		this.statusBarItem.setAttr(
@@ -612,7 +655,7 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		if (!this.statusBarItem) return;
 		this.statusBarItem.empty();
 		const iconSpan = this.statusBarItem.createSpan();
-		iconSpan.setText("⟳");
+		iconSpan.setText("🔄");
 		const textSpan = this.statusBarItem.createSpan();
 		textSpan.setText(" 同步中");
 		this.statusBarItem.setAttr(
@@ -625,7 +668,7 @@ export default class VaultFolderSyncPlugin extends Plugin {
 		if (!this.statusBarItem) return;
 		this.statusBarItem.empty();
 		const iconSpan = this.statusBarItem.createSpan();
-		iconSpan.setText("✔");
+		iconSpan.setText("✅");
 		const textSpan = this.statusBarItem.createSpan();
 		textSpan.setText(" 已同步");
 		this.statusBarItem.setAttr(
@@ -650,6 +693,67 @@ export default class VaultFolderSyncPlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	private getCurrentDeviceId(): string {
+		if (
+			this.settings.currentDeviceId &&
+			this.settings.currentDeviceId.trim().length > 0
+		) {
+			return this.settings.currentDeviceId.trim();
+		}
+		const platform = process.platform;
+		let host = "unknown-host";
+		try {
+			host = os.hostname();
+		} catch {
+			// ignore
+		}
+		const id = `${platform}-${host}`;
+		this.settings.currentDeviceId = id;
+		return id;
+	}
+
+	private ensureDeviceTargetsInitialized() {
+		if (!this.settings.deviceTargets) {
+			this.settings.deviceTargets = {};
+		}
+		const deviceId = this.getCurrentDeviceId();
+		if (!this.settings.deviceTargets[deviceId]) {
+			const base = Array.isArray(this.settings.targets)
+				? this.settings.targets
+				: [];
+			this.settings.deviceTargets[deviceId] = base.map((t) => ({ ...t }));
+		}
+		// 始终保持 legacy 字段与当前设备配置一致，兼容已有逻辑和测试
+		this.settings.targets = this.settings.deviceTargets[deviceId];
+	}
+
+	private getCurrentDeviceTargets(): SyncTarget[] {
+		this.ensureDeviceTargetsInitialized();
+		const deviceId = this.getCurrentDeviceId();
+		return this.settings.deviceTargets![deviceId]!;
+	}
+
+	private setCurrentDeviceTargets(targets: SyncTarget[]) {
+		const deviceId = this.getCurrentDeviceId();
+		if (!this.settings.deviceTargets) {
+			this.settings.deviceTargets = {};
+		}
+		this.settings.deviceTargets[deviceId] = targets;
+		this.settings.targets = targets;
+	}
+
+	// 供设置面板使用的辅助方法
+	getActiveTargetsForCurrentDevice(): SyncTarget[] {
+		return this.getCurrentDeviceTargets();
+	}
+
+	updateActiveTargetsForCurrentDevice(
+		updater: (prev: SyncTarget[]) => SyncTarget[],
+	) {
+		const updated = updater(this.getCurrentDeviceTargets());
+		this.setCurrentDeviceTargets(updated);
+	}
 }
 
 class VaultFolderSyncSettingTab extends PluginSettingTab {
@@ -665,6 +769,30 @@ class VaultFolderSyncSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		containerEl.createEl("h2", { text: "Vault Folder Sync 设置" });
+
+		new Setting(containerEl)
+			.setName("当前设备标识")
+			.setDesc(
+				"用于区分不同设备的同步目标配置。例如在 macOS 和 Windows 上使用不同的同步目录路径。",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("例如：macbook-pro / windows-office")
+					.setValue(this.plugin.settings.currentDeviceId ?? "")
+					.onChange(async (value) => {
+						const trimmed = value.trim();
+						if (!trimmed) return;
+						if (!this.plugin.settings.deviceTargets) {
+							this.plugin.settings.deviceTargets = {};
+						}
+						if (!this.plugin.settings.deviceTargets[trimmed]) {
+							this.plugin.settings.deviceTargets[trimmed] = [];
+						}
+						this.plugin.settings.currentDeviceId = trimmed;
+						await this.plugin.saveSettings();
+						this.display();
+					}),
+			);
 
 		const rulesSection = containerEl.createEl("div");
 		rulesSection.createEl("h3", { text: "同步规则概览" });
@@ -711,9 +839,10 @@ class VaultFolderSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		containerEl.createEl("h3", { text: "同步目标目录" });
+		containerEl.createEl("h3", { text: "同步目标目录（当前设备）" });
 
-		this.plugin.settings.targets.forEach((target) => {
+		const deviceTargets = this.plugin.getActiveTargetsForCurrentDevice();
+		deviceTargets.forEach((target) => {
 			const s = new Setting(containerEl)
 				.setName(target.path || "(未设置路径)")
 				.setDesc("将当前 vault 同步到该目录。")
@@ -765,10 +894,10 @@ class VaultFolderSyncSettingTab extends PluginSettingTab {
 						.setIcon("trash")
 						.setTooltip("删除该目标目录配置")
 						.onClick(async () => {
-							this.plugin.settings.targets =
-								this.plugin.settings.targets.filter(
-									(t) => t.id !== target.id,
-								);
+							this.plugin.updateActiveTargetsForCurrentDevice(
+								(prev) =>
+									prev.filter((t) => t.id !== target.id),
+							);
 							await this.plugin.saveSettings();
 							this.display();
 						}),
@@ -801,12 +930,17 @@ class VaultFolderSyncSettingTab extends PluginSettingTab {
 						const id = `${Date.now()}-${Math.random()
 							.toString(36)
 							.slice(2, 8)}`;
-						this.plugin.settings.targets.push({
-							id,
-							path: newPathValue,
-							enabled: true,
-							lastFullSyncDone: false,
-						});
+						this.plugin.updateActiveTargetsForCurrentDevice(
+							(prev) => [
+								...prev,
+								{
+									id,
+									path: newPathValue,
+									enabled: true,
+									lastFullSyncDone: false,
+								},
+							],
+						);
 						await this.plugin.saveSettings();
 						newPathValue = "";
 						this.display();

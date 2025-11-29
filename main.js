@@ -36,6 +36,7 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian4 = require("obsidian");
 var fs4 = __toESM(require("fs"));
 var path5 = __toESM(require("path"));
+var os = __toESM(require("os"));
 
 // diff-view.ts
 var import_obsidian = require("obsidian");
@@ -604,6 +605,10 @@ var VaultFolderSyncDiffView = class extends import_obsidian.ItemView {
     prevBtn.disabled = total <= 1;
     nextBtn.disabled = total <= 1;
     resolveBtn.disabled = !current;
+    resolveBtn.setAttr(
+      "title",
+      "\u6807\u8BB0\u8BE5\u6587\u4EF6\u51B2\u7A81\u5DF2\u89E3\u51B3\uFF0C\u5E76\u9ED8\u8BA4\u4EE5\u5F53\u524D Vault\uFF08\u6E90\u76EE\u5F55\uFF09\u4E2D\u7684\u5185\u5BB9\u4E3A\u51C6\u8986\u76D6\u76EE\u6807\u76EE\u5F55\u3002"
+    );
     prevBtn.onclick = () => {
       if (conflictEntries.length === 0) return;
       currentConflictIndex = (currentConflictIndex - 1 + conflictEntries.length) % conflictEntries.length;
@@ -616,6 +621,32 @@ var VaultFolderSyncDiffView = class extends import_obsidian.ItemView {
     };
     resolveBtn.onclick = async () => {
       if (!current) return;
+      if (current.targetPath) {
+        try {
+          const stat = await fs.promises.stat(current.sourcePath).catch(
+            () => null
+          );
+          if (stat && stat.isFile()) {
+            await ensureDirForView(path.dirname(current.targetPath));
+            await fs.promises.copyFile(
+              current.sourcePath,
+              current.targetPath
+            );
+            await fs.promises.utimes(
+              current.targetPath,
+              stat.atime,
+              stat.mtime
+            ).catch(() => {
+            });
+          }
+        } catch (err) {
+          console.error(
+            "Vault Folder Sync: failed to resolve conflict by keeping source file for",
+            current.relPath,
+            err
+          );
+        }
+      }
       await markConflictResolved(this.app, current.relPath);
       conflictEntries = conflictEntries.filter(
         (e) => e.relPath !== current.relPath
@@ -631,14 +662,47 @@ var VaultFolderSyncDiffView = class extends import_obsidian.ItemView {
     });
     pre.style.flex = "1 1 auto";
     pre.style.width = "100%";
-    pre.style.whiteSpace = "pre-wrap";
+    pre.style.whiteSpace = "pre";
     pre.style.fontFamily = "var(--font-monospace)";
     pre.style.overflowY = "auto";
-    if (current) {
-      pre.setText(current.patch || "(\u65E0\u5DEE\u5F02\u6216\u65E0\u6CD5\u52A0\u8F7D\u5185\u5BB9)");
+    if (current && current.patch) {
+      this.renderPatchWithNavigation(pre, current);
+    } else if (current) {
+      pre.setText("(\u65E0\u5DEE\u5F02\u6216\u65E0\u6CD5\u52A0\u8F7D\u5185\u5BB9)");
     } else {
       pre.setText("(\u5F53\u524D\u6CA1\u6709\u53EF\u663E\u793A\u7684\u51B2\u7A81 diff)");
     }
+  }
+  renderPatchWithNavigation(pre, conflict) {
+    const lines = conflict.patch.split(/\r?\n/);
+    const sourceLineMap = buildSourceLineMap(lines);
+    pre.empty();
+    for (let i = 0; i < lines.length; i++) {
+      const lineText = lines[i];
+      const span = pre.createSpan({
+        text: lineText === "" ? " " : lineText
+      });
+      span.addClass("vault-folder-sync-diff-line");
+      span.setAttr("data-line-index", String(i));
+      const srcLine = sourceLineMap[i];
+      if (typeof srcLine === "number") {
+        span.setAttr("data-source-line", String(srcLine));
+      }
+      pre.createEl("br");
+    }
+    pre.onclick = (ev) => {
+      const target = ev.target;
+      if (!target) return;
+      const lineEl = target.closest(
+        ".vault-folder-sync-diff-line"
+      );
+      if (!lineEl) return;
+      const sourceLineAttr = lineEl.getAttr("data-source-line");
+      if (!sourceLineAttr) return;
+      const sourceLine = Number(sourceLineAttr);
+      if (!Number.isFinite(sourceLine) || sourceLine <= 0) return;
+      scrollVaultToSourceLine(this.app, conflict.relPath, sourceLine);
+    };
   }
 };
 function registerDiffView(plugin) {
@@ -646,6 +710,62 @@ function registerDiffView(plugin) {
     DIFF_VIEW_TYPE,
     (leaf) => new VaultFolderSyncDiffView(leaf)
   );
+}
+async function openDiffForConflict(app, relPath, sourcePath, targetPath) {
+  const [sourceText, targetText] = await Promise.all([
+    readFileSafe(sourcePath),
+    readFileSafe(targetPath)
+  ]);
+  const patch = createTwoFilesPatch(
+    `source: ${relPath}`,
+    `target: ${relPath}`,
+    sourceText,
+    targetText
+  );
+  const existingIndex = conflictEntries.findIndex(
+    (e) => e.relPath === relPath && e.sourcePath === sourcePath && e.targetPath === targetPath
+  );
+  if (existingIndex >= 0) {
+    conflictEntries[existingIndex].patch = patch;
+    currentConflictIndex = existingIndex;
+  } else {
+    conflictEntries.push({
+      relPath,
+      sourcePath,
+      targetPath,
+      patch
+    });
+    currentConflictIndex = conflictEntries.length - 1;
+  }
+  let leaf = null;
+  try {
+    const leaves = app.workspace.getLeavesOfType(DIFF_VIEW_TYPE);
+    if (leaves.length > 0) {
+      for (let i = 1; i < leaves.length; i++) {
+        leaves[i].detach();
+      }
+      leaf = leaves[0];
+    } else {
+      const maybeLeaf = app.workspace.getRightLeaf(false);
+      if (!maybeLeaf) {
+        return;
+      }
+      leaf = maybeLeaf;
+    }
+    await leaf.setViewState({
+      type: DIFF_VIEW_TYPE,
+      active: true,
+      state: {
+        index: currentConflictIndex
+      }
+    });
+    app.workspace.revealLeaf(leaf);
+  } catch (err) {
+    console.error(
+      "Vault Folder Sync: failed to open conflict diff view",
+      err
+    );
+  }
 }
 function closeDiffViewIfNoConflicts(app) {
   if (conflictEntries.length > 0) return;
@@ -671,6 +791,14 @@ async function markConflictResolved(app, relPath) {
   await ensureDirForView(path.dirname(logPath));
   await fs.promises.writeFile(logPath, text, "utf8");
 }
+async function readFileSafe(p) {
+  try {
+    const buf = await fs.promises.readFile(p);
+    return buf.toString("utf8");
+  } catch {
+    return "";
+  }
+}
 async function readRawLogEntriesForView(p) {
   try {
     const raw = await fs.promises.readFile(p, "utf8");
@@ -694,6 +822,45 @@ async function readRawLogEntriesForView(p) {
 }
 async function ensureDirForView(dirPath) {
   await fs.promises.mkdir(dirPath, { recursive: true });
+}
+function buildSourceLineMap(lines) {
+  const map = new Array(lines.length).fill(null);
+  let origLine = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("@@")) {
+      const m = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (m) {
+        origLine = Number(m[1]);
+      }
+      continue;
+    }
+    if (!origLine) continue;
+    const prefix = line[0];
+    if (prefix === " " || prefix === "-") {
+      map[i] = origLine;
+      origLine += 1;
+    } else if (prefix === "+") {
+      map[i] = origLine > 0 ? origLine : null;
+    }
+  }
+  return map;
+}
+async function scrollVaultToSourceLine(app, relPath, sourceLine) {
+  const file = app.vault.getAbstractFileByPath(relPath);
+  if (!(file instanceof import_obsidian.TFile)) return;
+  const leaf = app.workspace.getLeaf(false);
+  if (!leaf) return;
+  await leaf.openFile(file);
+  const view = app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+  if (!view) return;
+  const editor = view.editor;
+  const maxLine = editor.lineCount() - 1;
+  const lineIndex = Math.max(0, Math.min(maxLine, sourceLine - 1));
+  editor.setCursor({ line: lineIndex, ch: 0 });
+  const from = { line: lineIndex, ch: 0 };
+  const to = { line: Math.min(maxLine, lineIndex + 1), ch: 0 };
+  editor.scrollIntoView({ from, to }, true);
 }
 
 // log-view.ts
@@ -836,60 +1003,8 @@ var import_obsidian3 = require("obsidian");
 var fs3 = __toESM(require("fs"));
 var path4 = __toESM(require("path"));
 var MTIME_EPS_MS = 1;
-var DIFF_VIEW_TYPE2 = "vault-folder-sync-diff-view";
 var LOG_FILE_NAME = "vault-folder-sync-log.jsonl";
 var LOG_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
-var conflictEntries2 = [];
-var currentConflictIndex2 = 0;
-async function openDiffForConflict(app, relPath, sourcePath, targetPath) {
-  const [sourceText, targetText] = await Promise.all([
-    readFileSafe(sourcePath),
-    readFileSafe(targetPath)
-  ]);
-  const patch = createTwoFilesPatch(
-    `source: ${relPath}`,
-    `target: ${relPath}`,
-    sourceText,
-    targetText
-  );
-  const existingIndex = conflictEntries2.findIndex(
-    (e) => e.relPath === relPath && e.sourcePath === sourcePath && e.targetPath === targetPath
-  );
-  if (existingIndex >= 0) {
-    conflictEntries2[existingIndex].patch = patch;
-    currentConflictIndex2 = existingIndex;
-  } else {
-    conflictEntries2.push({
-      relPath,
-      sourcePath,
-      targetPath,
-      patch
-    });
-    currentConflictIndex2 = conflictEntries2.length - 1;
-  }
-  const leaves = app.workspace.getLeavesOfType(DIFF_VIEW_TYPE2);
-  let leaf;
-  if (leaves.length > 0) {
-    for (let i = 1; i < leaves.length; i++) {
-      leaves[i].detach();
-    }
-    leaf = leaves[0];
-  } else {
-    const maybeLeaf = app.workspace.getRightLeaf(false);
-    if (!maybeLeaf) {
-      return;
-    }
-    leaf = maybeLeaf;
-  }
-  await leaf.setViewState({
-    type: DIFF_VIEW_TYPE2,
-    active: true,
-    state: {
-      index: currentConflictIndex2
-    }
-  });
-  app.workspace.revealLeaf(leaf);
-}
 async function runReverseSyncForTargets(app, sourceRoot, targetRoots) {
   if (targetRoots.length === 0) return;
   const deletionLogPath = getDeletionLogPath(sourceRoot);
@@ -1412,14 +1527,6 @@ async function copyFileWithMetadata(sourceFile, targetFile) {
     );
   }
 }
-async function readFileSafe(p) {
-  try {
-    const buf = await fs3.promises.readFile(p);
-    return buf.toString("utf8");
-  } catch {
-    return "";
-  }
-}
 async function appendModificationLogEntry(logPath, entry) {
   await ensureDir(path4.dirname(logPath));
   const enriched = {
@@ -1445,6 +1552,7 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
     this.pendingRenames = [];
     this.isSyncing = false;
     this.statusBarItem = null;
+    this.isReverseSyncing = false;
   }
   async onload() {
     await this.loadSettings();
@@ -1461,7 +1569,7 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
       }, intervalMs)
     );
     const sourceRoot = this.getVaultRootPath();
-    const enabledTargets = this.settings.targets.filter(
+    const enabledTargets = this.getCurrentDeviceTargets().filter(
       (t) => t.enabled && t.path.trim().length > 0
     );
     const enabledTargetPaths = enabledTargets.map((t) => t.path);
@@ -1476,7 +1584,7 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
   }
   async runPeriodicSync() {
     const sourceRoot = this.getVaultRootPath();
-    const enabledTargets = this.settings.targets.filter(
+    const enabledTargets = this.getCurrentDeviceTargets().filter(
       (t) => t.path.trim().length > 0
     );
     const enabledTargetPaths = enabledTargets.map((t) => t.path);
@@ -1501,10 +1609,14 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
       this.app.vault.on("create", (file) => {
         if (file instanceof import_obsidian4.TFile) {
           this.markFileChanged(file, "created");
-          logLocalSourceChange(this.app, file.path, "modified").catch(
-            () => {
-            }
-          );
+          if (!this.isReverseSyncing) {
+            logLocalSourceChange(
+              this.app,
+              file.path,
+              "modified"
+            ).catch(() => {
+            });
+          }
         }
       })
     );
@@ -1512,27 +1624,39 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
       this.app.vault.on("modify", (file) => {
         if (file instanceof import_obsidian4.TFile) {
           this.markFileChanged(file, "modified");
-          logLocalSourceChange(this.app, file.path, "modified").catch(
-            () => {
-            }
-          );
+          if (!this.isReverseSyncing) {
+            logLocalSourceChange(
+              this.app,
+              file.path,
+              "modified"
+            ).catch(() => {
+            });
+          }
         }
       })
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
         this.markPathDeleted(file.path);
-        logLocalSourceChange(this.app, file.path, "deleted").catch(
-          () => {
-          }
-        );
+        if (!this.isReverseSyncing) {
+          logLocalSourceChange(
+            this.app,
+            file.path,
+            "deleted"
+          ).catch(() => {
+          });
+        }
       })
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         this.markRename(oldPath, file.path);
-        logLocalRename(this.app, oldPath, file.path).catch(() => {
-        });
+        if (!this.isReverseSyncing) {
+          logLocalRename(this.app, oldPath, file.path).catch(
+            () => {
+            }
+          );
+        }
       })
     );
   }
@@ -1590,7 +1714,7 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
     this.isSyncing = true;
     try {
       const sourceRoot = this.getVaultRootPath();
-      const enabledTargets = this.settings.targets.filter(
+      const enabledTargets = this.getCurrentDeviceTargets().filter(
         (t) => t.enabled && t.path.trim().length > 0
       );
       if (enabledTargets.length === 0) {
@@ -1857,21 +1981,26 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
     await fs4.promises.writeFile(markerPath, content, "utf8");
   }
   async runReverseSyncOnce(sourceRoot) {
-    const reverseTargets = this.settings.targets.filter(
+    const reverseTargets = this.getCurrentDeviceTargets().filter(
       (t) => t.enabled && t.enableReverseSync && t.path.trim().length > 0
     );
     if (reverseTargets.length === 0) return;
-    await runReverseSyncForTargets(
-      this.app,
-      sourceRoot,
-      reverseTargets.map((t) => t.path)
-    );
+    this.isReverseSyncing = true;
+    try {
+      await runReverseSyncForTargets(
+        this.app,
+        sourceRoot,
+        reverseTargets.map((t) => t.path)
+      );
+    } finally {
+      this.isReverseSyncing = false;
+    }
   }
   setStatusPending() {
     if (!this.statusBarItem) return;
     this.statusBarItem.empty();
     const iconSpan = this.statusBarItem.createSpan();
-    iconSpan.setText("\u25CF");
+    iconSpan.setText("\u23F3");
     const textSpan = this.statusBarItem.createSpan();
     textSpan.setText(" \u5F85\u540C\u6B65");
     this.statusBarItem.setAttr(
@@ -1883,7 +2012,7 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
     if (!this.statusBarItem) return;
     this.statusBarItem.empty();
     const iconSpan = this.statusBarItem.createSpan();
-    iconSpan.setText("\u27F3");
+    iconSpan.setText("\u{1F504}");
     const textSpan = this.statusBarItem.createSpan();
     textSpan.setText(" \u540C\u6B65\u4E2D");
     this.statusBarItem.setAttr(
@@ -1895,7 +2024,7 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
     if (!this.statusBarItem) return;
     this.statusBarItem.empty();
     const iconSpan = this.statusBarItem.createSpan();
-    iconSpan.setText("\u2714");
+    iconSpan.setText("\u2705");
     const textSpan = this.statusBarItem.createSpan();
     textSpan.setText(" \u5DF2\u540C\u6B65");
     this.statusBarItem.setAttr(
@@ -1915,6 +2044,52 @@ var VaultFolderSyncPlugin = class extends import_obsidian4.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
   }
+  getCurrentDeviceId() {
+    if (this.settings.currentDeviceId && this.settings.currentDeviceId.trim().length > 0) {
+      return this.settings.currentDeviceId.trim();
+    }
+    const platform = process.platform;
+    let host = "unknown-host";
+    try {
+      host = os.hostname();
+    } catch {
+    }
+    const id = `${platform}-${host}`;
+    this.settings.currentDeviceId = id;
+    return id;
+  }
+  ensureDeviceTargetsInitialized() {
+    if (!this.settings.deviceTargets) {
+      this.settings.deviceTargets = {};
+    }
+    const deviceId = this.getCurrentDeviceId();
+    if (!this.settings.deviceTargets[deviceId]) {
+      const base = Array.isArray(this.settings.targets) ? this.settings.targets : [];
+      this.settings.deviceTargets[deviceId] = base.map((t) => ({ ...t }));
+    }
+    this.settings.targets = this.settings.deviceTargets[deviceId];
+  }
+  getCurrentDeviceTargets() {
+    this.ensureDeviceTargetsInitialized();
+    const deviceId = this.getCurrentDeviceId();
+    return this.settings.deviceTargets[deviceId];
+  }
+  setCurrentDeviceTargets(targets) {
+    const deviceId = this.getCurrentDeviceId();
+    if (!this.settings.deviceTargets) {
+      this.settings.deviceTargets = {};
+    }
+    this.settings.deviceTargets[deviceId] = targets;
+    this.settings.targets = targets;
+  }
+  // 供设置面板使用的辅助方法
+  getActiveTargetsForCurrentDevice() {
+    return this.getCurrentDeviceTargets();
+  }
+  updateActiveTargetsForCurrentDevice(updater) {
+    const updated = updater(this.getCurrentDeviceTargets());
+    this.setCurrentDeviceTargets(updated);
+  }
 };
 var VaultFolderSyncSettingTab = class extends import_obsidian4.PluginSettingTab {
   constructor(app, plugin) {
@@ -1925,6 +2100,23 @@ var VaultFolderSyncSettingTab = class extends import_obsidian4.PluginSettingTab 
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Vault Folder Sync \u8BBE\u7F6E" });
+    new import_obsidian4.Setting(containerEl).setName("\u5F53\u524D\u8BBE\u5907\u6807\u8BC6").setDesc(
+      "\u7528\u4E8E\u533A\u5206\u4E0D\u540C\u8BBE\u5907\u7684\u540C\u6B65\u76EE\u6807\u914D\u7F6E\u3002\u4F8B\u5982\u5728 macOS \u548C Windows \u4E0A\u4F7F\u7528\u4E0D\u540C\u7684\u540C\u6B65\u76EE\u5F55\u8DEF\u5F84\u3002"
+    ).addText(
+      (text) => text.setPlaceholder("\u4F8B\u5982\uFF1Amacbook-pro / windows-office").setValue(this.plugin.settings.currentDeviceId ?? "").onChange(async (value) => {
+        const trimmed = value.trim();
+        if (!trimmed) return;
+        if (!this.plugin.settings.deviceTargets) {
+          this.plugin.settings.deviceTargets = {};
+        }
+        if (!this.plugin.settings.deviceTargets[trimmed]) {
+          this.plugin.settings.deviceTargets[trimmed] = [];
+        }
+        this.plugin.settings.currentDeviceId = trimmed;
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
     const rulesSection = containerEl.createEl("div");
     rulesSection.createEl("h3", { text: "\u540C\u6B65\u89C4\u5219\u6982\u89C8" });
     const forwardList = rulesSection.createEl("ul");
@@ -1962,8 +2154,9 @@ var VaultFolderSyncSettingTab = class extends import_obsidian4.PluginSettingTab 
         }
       })
     );
-    containerEl.createEl("h3", { text: "\u540C\u6B65\u76EE\u6807\u76EE\u5F55" });
-    this.plugin.settings.targets.forEach((target) => {
+    containerEl.createEl("h3", { text: "\u540C\u6B65\u76EE\u6807\u76EE\u5F55\uFF08\u5F53\u524D\u8BBE\u5907\uFF09" });
+    const deviceTargets = this.plugin.getActiveTargetsForCurrentDevice();
+    deviceTargets.forEach((target) => {
       const s = new import_obsidian4.Setting(containerEl).setName(target.path || "(\u672A\u8BBE\u7F6E\u8DEF\u5F84)").setDesc("\u5C06\u5F53\u524D vault \u540C\u6B65\u5230\u8BE5\u76EE\u5F55\u3002").addToggle((toggle) => {
         const wrapper = toggle.toggleEl.parentElement;
         toggle.setValue(target.enabled).setTooltip("\u542F\u7528\u6B63\u5411\u540C\u6B65\uFF08\u4ECE\u5F53\u524D vault \u540C\u6B65\u5230\u8BE5\u76EE\u5F55\uFF09").onChange(async (value) => {
@@ -1997,8 +2190,8 @@ var VaultFolderSyncSettingTab = class extends import_obsidian4.PluginSettingTab 
         })
       ).addExtraButton(
         (button) => button.setIcon("trash").setTooltip("\u5220\u9664\u8BE5\u76EE\u6807\u76EE\u5F55\u914D\u7F6E").onClick(async () => {
-          this.plugin.settings.targets = this.plugin.settings.targets.filter(
-            (t) => t.id !== target.id
+          this.plugin.updateActiveTargetsForCurrentDevice(
+            (prev) => prev.filter((t) => t.id !== target.id)
           );
           await this.plugin.saveSettings();
           this.display();
@@ -2019,12 +2212,17 @@ var VaultFolderSyncSettingTab = class extends import_obsidian4.PluginSettingTab 
           return;
         }
         const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        this.plugin.settings.targets.push({
-          id,
-          path: newPathValue,
-          enabled: true,
-          lastFullSyncDone: false
-        });
+        this.plugin.updateActiveTargetsForCurrentDevice(
+          (prev) => [
+            ...prev,
+            {
+              id,
+              path: newPathValue,
+              enabled: true,
+              lastFullSyncDone: false
+            }
+          ]
+        );
         await this.plugin.saveSettings();
         newPathValue = "";
         this.display();
